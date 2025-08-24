@@ -10,6 +10,8 @@
 #include <atomic>
 #include <vector>
 #include <algorithm>
+#include <netinet/if_ether.h>   // для ether_header и ETHERTYPE_IP
+
 
 struct FlowKey {
     std::string src;
@@ -18,19 +20,24 @@ struct FlowKey {
     uint16_t dport;
 
     bool operator==(const FlowKey& o) const {
-        return src==o.src && dst==o.dst && sport==o.sport && dport==o.dport;
+        return src == o.src && dst == o.dst && sport == o.sport && dport == o.dport;
     }
 };
 
 struct FlowKeyHash {
     std::size_t operator()(const FlowKey& k) const {
-        return std::hash<std::string>()(k.src) ^ std::hash<std::string>()(k.dst) ^ k.sport ^ k.dport;
+        return std::hash<std::string>()(k.src) ^
+               (std::hash<std::string>()(k.dst) << 1) ^
+               (std::hash<uint16_t>()(k.sport) << 2) ^
+               (std::hash<uint16_t>()(k.dport) << 3);
     }
 };
+
 
 static std::unordered_map<FlowKey, FlowStats, FlowKeyHash> flows;
 static std::mutex flows_mtx;
 static std::atomic<bool> running{true};
+
 
 FlowMonitor::FlowMonitor(const std::string& iface) : iface_(iface) {}
 
@@ -39,7 +46,8 @@ void FlowMonitor::run() {
     pcap_t* handle = pcap_open_live(iface_.c_str(), BUFSIZ, 1, 1000, errbuf);
     if (!handle) throw std::runtime_error("pcap_open_live failed");
 
-    std::thread reporter([&](){
+    // Отдельный поток — периодический вывод статистики
+    std::thread reporter([&]() {
         while (running) {
             std::this_thread::sleep_for(std::chrono::seconds(1));
             std::vector<std::pair<FlowKey, FlowStats>> v;
@@ -47,22 +55,24 @@ void FlowMonitor::run() {
                 std::lock_guard<std::mutex> lk(flows_mtx);
                 for (auto& kv : flows) v.push_back(kv);
             }
-            std::sort(v.begin(), v.end(), [](auto& a, auto& b){
+            std::sort(v.begin(), v.end(), [](auto& a, auto& b) {
                 return a.second.bytes > b.second.bytes;
             });
             std::cout << "=== TOP FLOWS ===\n";
-            for (size_t i=0; i<v.size() && i<10; i++) {
+            for (size_t i = 0; i < v.size() && i < 10; i++) {
                 auto& k = v[i].first;
                 auto& st = v[i].second;
                 std::cout << k.src << ":" << k.sport << " -> "
                           << k.dst << ":" << k.dport
                           << " bytes=" << st.bytes
                           << " payload=" << st.payload
+                          << " packets=" << st.packets
                           << "\n";
             }
         }
     });
 
+    // Захват пакетов
     while (running) {
         pcap_pkthdr* header;
         const u_char* packet;
@@ -78,7 +88,7 @@ void FlowMonitor::run() {
         int iphdr_len = iph->ip_hl * 4;
         const struct tcphdr* tcph = (struct tcphdr*)((u_char*)iph + iphdr_len);
 
-        FlowKey k {
+        FlowKey k{
             inet_ntoa(iph->ip_src),
             inet_ntoa(iph->ip_dst),
             ntohs(tcph->th_sport),
@@ -90,7 +100,7 @@ void FlowMonitor::run() {
         if (st.packets == 0) st.start = std::chrono::steady_clock::now();
         st.packets++;
         st.bytes += header->len;
-        st.payload += ntohs(iph->ip_len) - iphdr_len - (tcph->th_off*4);
+        st.payload += std::max(0, ntohs(iph->ip_len) - iphdr_len - (tcph->th_off * 4));
     }
 
     reporter.join();
